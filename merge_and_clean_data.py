@@ -168,9 +168,11 @@ class DataMerger:
             
             return group
         
-        self.df_merged = self.df_merged.groupby('TRANSFORMER_ID', group_keys=False).apply(
-            interpolate_load, include_groups=False
-        )
+        # 使用 transform 和自定义函数来避免 include_groups 问题
+        result_list = []
+        for transformer_id, group in self.df_merged.groupby('TRANSFORMER_ID'):
+            result_list.append(interpolate_load(group))
+        self.df_merged = pd.concat(result_list, ignore_index=True)
         
         # 删除剩余的长时缺失数据
         remaining_missing = self.df_merged['LOAD'].isnull().sum()
@@ -335,20 +337,23 @@ class DataMerger:
             group['is_outlier'] = (group['LOAD'] < lower_bound) | (group['LOAD'] > upper_bound)
             
             # 检查是否为极端天气期间（保留这些异常值）
+            # 只有当极端天气字段值 > 0 时才认为是真正的极端天气
             extreme_weather_cols = [col for col in group.columns if 'HIGH_TEMPERATURE' in col 
                                    or 'LOW_TEMPERATURE' in col or 'HIGH_HUMIDITY' in col
                                    or 'WIND_LEVEL' in col or 'PRECIPITATION' in col]
             
             if extreme_weather_cols:
-                # 如果有任何极端天气标记，则保留该异常值
-                has_extreme_weather = group[extreme_weather_cols].notna().any(axis=1)
+                # 检查是否有任何极端天气标记 > 0（不是填充的 0）
+                has_extreme_weather = (group[extreme_weather_cols] > 0).any(axis=1)
                 group['is_outlier'] = group['is_outlier'] & ~has_extreme_weather
             
             return group
         
-        self.df_merged = self.df_merged.groupby('TRANSFORMER_ID', group_keys=False).apply(
-            filter_outliers, include_groups=False
-        )
+        # 使用循环来避免 include_groups 问题
+        result_list = []
+        for transformer_id, group in self.df_merged.groupby('TRANSFORMER_ID'):
+            result_list.append(filter_outliers(group))
+        self.df_merged = pd.concat(result_list, ignore_index=True)
         
         # 统计异常值数量
         outlier_count = self.df_merged['is_outlier'].sum()
