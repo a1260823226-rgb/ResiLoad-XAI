@@ -12,3 +12,5 @@ qistik说明文档：https://qiskit.qotlabs.org/docs/api/qiskit
 pennylane说明文档：https://docs.pennylane.ai/en/stable/index.html
 
 SHAP说明文档：https://shap.readthedocs.cn/en/latest/api.html
+
+原始数据来源：https://github.com/yuruotao/District-power
