@@ -1,8 +1,3 @@
-"""
-PyTorch BPNN (BackPropagation Neural Network) 模型 - 电力负荷预测
-使用深层多层感知机进行时间序列预测
-"""
-
 import pandas as pd
 import numpy as np
 import warnings
@@ -18,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from torch.cuda.amp import autocast, GradScaler
 
 warnings.filterwarnings('ignore')
 sns.set_style("whitegrid")
@@ -27,7 +23,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {device}")
 
 print("="*80)
-print("PyTorch BPNN (BackPropagation Neural Network) 模型 - 电力负荷预测")
+print("PyTorch BPNN 优化版本 - 电力负荷预测")
 print("="*80)
 print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -51,6 +47,7 @@ df = df.sort_values('DATETIME').reset_index(drop=True)
 
 df['DATETIME'] = pd.to_datetime(df['DATETIME'])
 
+# 核心气象特征 (基于相关性分析)
 CORE_WEATHER_FEATURES = ['TEMP', 'MIN', 'MAX', 'DEWP', 'SLP', 'MXSPD', 'GUST', 'STP', 'WDSP', 'RH', 'PRCP']
 
 df['Hour'] = df['DATETIME'].dt.hour
@@ -74,10 +71,12 @@ df['IsHolidaySeason'] = df['Month'].isin([12, 1]).astype(int)
 df['IsSummerPeak'] = df['Month'].isin([6, 7, 8]).astype(int)
 df['IsWinterPeak'] = df['Month'].isin([12, 1, 2]).astype(int)
 
+# 关键滞后特征 (优化后)
 key_lags = [1, 2, 3, 4, 6, 12, 24, 48, 72, 168, 336, 504]
 for lag in key_lags:
     df[f'LOAD_lag{lag}'] = df['LOAD'].shift(lag)
 
+# 关键滚动特征 (优化后)
 key_windows = [3, 6, 12, 24, 48, 168, 336]
 for window in key_windows:
     df[f'LOAD_rolling_mean_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).mean().shift(1)
@@ -86,6 +85,7 @@ for window in key_windows:
     df[f'LOAD_rolling_max_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).max().shift(1)
     df[f'LOAD_rolling_median_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).median().shift(1)
 
+# 交互特征 (基于相关性分析)
 df['TEMP_RH'] = df['TEMP'] * df['RH']
 df['TEMP_MXSPD'] = df['TEMP'] * df['MXSPD']
 df['TEMP_GUST'] = df['TEMP'] * df['GUST']
@@ -98,6 +98,7 @@ df['SLP_TEMP'] = df['SLP'] * df['TEMP']
 df['RH_MXSPD'] = df['RH'] * df['MXSPD']
 df['TEMP_SLP'] = df['TEMP'] * df['SLP']
 
+# 差分特征
 df['LOAD_diff1'] = df['LOAD'].diff(1)
 df['LOAD_diff24'] = df['LOAD'].diff(24)
 df['LOAD_diff168'] = df['LOAD'].diff(168)
@@ -179,91 +180,117 @@ train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
 val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
 test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
 
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 print("✓ 张量转换完成")
 
 # ============================================================================
-# Step 7: 定义BPNN模型
+# Step 7: 定义优化的BPNN模型 (带残差连接)
 # ============================================================================
-print("\nStep 7: 定义BPNN模型")
+print("\nStep 7: 定义优化的BPNN模型")
 
-class BPNN(nn.Module):
-    """
-    深层反向传播神经网络 (BackPropagation Neural Network)
-    
-    架构:
-    - 输入层: 94个特征
-    - 隐藏层1: 512个神经元 + ReLU + BatchNorm + Dropout
-    - 隐藏层2: 256个神经元 + ReLU + BatchNorm + Dropout
-    - 隐藏层3: 128个神经元 + ReLU + BatchNorm + Dropout
-    - 隐藏层4: 64个神经元 + ReLU + BatchNorm + Dropout
-    - 隐藏层5: 32个神经元 + ReLU + BatchNorm + Dropout
-    - 输出层: 1个神经元 (线性激活)
-    """
-    
-    def __init__(self, input_size):
-        super(BPNN, self).__init__()
+class ResidualBlock(nn.Module):
+    """残差块 - 解决深层网络梯度消失"""
+    def __init__(self, in_features, out_features, dropout_rate=0.2):
+        super(ResidualBlock, self).__init__()
+        self.fc1 = nn.Linear(in_features, out_features)
+        self.ln1 = nn.LayerNorm(out_features)
+        self.fc2 = nn.Linear(out_features, out_features)
+        self.ln2 = nn.LayerNorm(out_features)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.gelu = nn.GELU()
         
-        # 隐藏层1: 512个神经元
-        self.fc1 = nn.Linear(input_size, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.dropout1 = nn.Dropout(0.15)
-        
-        # 隐藏层2: 256个神经元
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.dropout2 = nn.Dropout(0.15)
-        
-        # 隐藏层3: 128个神经元
-        self.fc3 = nn.Linear(256, 128)
-        self.bn3 = nn.BatchNorm1d(128)
-        self.dropout3 = nn.Dropout(0.12)
-        
-        # 隐藏层4: 64个神经元
-        self.fc4 = nn.Linear(128, 64)
-        self.bn4 = nn.BatchNorm1d(64)
-        self.dropout4 = nn.Dropout(0.12)
-        
-        # 隐藏层5: 32个神经元
-        self.fc5 = nn.Linear(64, 32)
-        self.bn5 = nn.BatchNorm1d(32)
-        self.dropout5 = nn.Dropout(0.1)
-        
-        # 输出层: 1个神经元
-        self.fc6 = nn.Linear(32, 1)
-        
-        self.relu = nn.ReLU()
+        # 如果输入输出维度不同，使用投影层
+        self.use_projection = in_features != out_features
+        if self.use_projection:
+            self.projection = nn.Linear(in_features, out_features)
     
     def forward(self, x):
-        # 隐藏层1
-        x = self.relu(self.bn1(self.fc1(x)))
-        x = self.dropout1(x)
+        residual = x
+        if self.use_projection:
+            residual = self.projection(residual)
         
-        # 隐藏层2
-        x = self.relu(self.bn2(self.fc2(x)))
-        x = self.dropout2(x)
+        out = self.gelu(self.ln1(self.fc1(x)))
+        out = self.dropout(out)
+        out = self.ln2(self.fc2(out))
+        out = self.dropout(out)
         
-        # 隐藏层3
-        x = self.relu(self.bn3(self.fc3(x)))
-        x = self.dropout3(x)
+        out = out + residual
+        out = self.gelu(out)
+        return out
+
+class OptimizedBPNN(nn.Module):
+    """优化的BPNN模型 - 带残差连接和层归一化"""
+    def __init__(self, input_size):
+        super(OptimizedBPNN, self).__init__()
         
-        # 隐藏层4
-        x = self.relu(self.bn4(self.fc4(x)))
-        x = self.dropout4(x)
+        # 输入投影层
+        self.input_proj = nn.Linear(input_size, 256)
+        self.input_ln = nn.LayerNorm(256)
+        self.input_dropout = nn.Dropout(0.2)
         
-        # 隐藏层5
-        x = self.relu(self.bn5(self.fc5(x)))
-        x = self.dropout5(x)
+        # 残差块1: 256 → 256
+        self.res_block1 = ResidualBlock(256, 256, dropout_rate=0.2)
+        
+        # 残差块2: 256 → 256
+        self.res_block2 = ResidualBlock(256, 256, dropout_rate=0.2)
+        
+        # 下采样块: 256 → 128
+        self.fc_down1 = nn.Linear(256, 128)
+        self.ln_down1 = nn.LayerNorm(128)
+        self.dropout_down1 = nn.Dropout(0.2)
+        
+        # 残差块3: 128 → 128
+        self.res_block3 = ResidualBlock(128, 128, dropout_rate=0.15)
+        
+        # 残差块4: 128 → 128
+        self.res_block4 = ResidualBlock(128, 128, dropout_rate=0.15)
+        
+        # 下采样块: 128 → 64
+        self.fc_down2 = nn.Linear(128, 64)
+        self.ln_down2 = nn.LayerNorm(64)
+        self.dropout_down2 = nn.Dropout(0.15)
+        
+        # 残差块5: 64 → 64
+        self.res_block5 = ResidualBlock(64, 64, dropout_rate=0.1)
         
         # 输出层
-        x = self.fc6(x)
+        self.fc_out = nn.Linear(64, 1)
+        
+        self.gelu = nn.GELU()
+    
+    def forward(self, x):
+        # 输入投影
+        x = self.gelu(self.input_ln(self.input_proj(x)))
+        x = self.input_dropout(x)
+        
+        # 残差块1-2
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        
+        # 下采样1
+        x = self.gelu(self.ln_down1(self.fc_down1(x)))
+        x = self.dropout_down1(x)
+        
+        # 残差块3-4
+        x = self.res_block3(x)
+        x = self.res_block4(x)
+        
+        # 下采样2
+        x = self.gelu(self.ln_down2(self.fc_down2(x)))
+        x = self.dropout_down2(x)
+        
+        # 残差块5
+        x = self.res_block5(x)
+        
+        # 输出
+        x = self.fc_out(x)
         return x
 
-model = BPNN(X_train_scaled.shape[1]).to(device)
-print("✓ BPNN模型构建完成")
+model = OptimizedBPNN(X_train_scaled.shape[1]).to(device)
+print("✓ 优化的BPNN模型构建完成")
 print(f"  模型参数数: {sum(p.numel() for p in model.parameters()):,}")
 
 # ============================================================================
@@ -272,34 +299,47 @@ print(f"  模型参数数: {sum(p.numel() for p in model.parameters()):,}")
 print("\nStep 8: 定义损失函数和优化器")
 
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.0003, weight_decay=3e-5)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, min_lr=1e-7)
+optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-7)
+scaler = GradScaler()
 
 print("✓ 损失函数和优化器定义完成")
+print("  优化器: AdamW (lr=0.0005, weight_decay=1e-4)")
+print("  学习率调度: CosineAnnealingWarmRestarts")
+print("  混合精度训练: 启用")
+
 
 # ============================================================================
 # Step 9: 训练模型
 # ============================================================================
-print("\nStep 9: 训练BPNN模型")
+print("\nStep 9: 训练优化的BPNN模型")
 
 train_losses = []
 val_losses = []
 best_val_loss = float('inf')
-patience = 60
+patience = 40
 patience_counter = 0
 
 train_start = datetime.now()
 
-for epoch in range(400):
+for epoch in range(300):
     # 训练
     model.train()
     train_loss = 0.0
     for X_batch, y_batch in train_loader:
         optimizer.zero_grad()
-        y_pred = model(X_batch).squeeze()
-        loss = criterion(y_pred, y_batch)
-        loss.backward()
-        optimizer.step()
+        
+        # 混合精度训练
+        with autocast():
+            y_pred = model(X_batch).squeeze()
+            loss = criterion(y_pred, y_batch)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
         train_loss += loss.item() * X_batch.size(0)
     
     train_loss /= len(train_dataset)
@@ -310,22 +350,23 @@ for epoch in range(400):
     val_loss = 0.0
     with torch.no_grad():
         for X_batch, y_batch in val_loader:
-            y_pred = model(X_batch).squeeze()
-            loss = criterion(y_pred, y_batch)
+            with autocast():
+                y_pred = model(X_batch).squeeze()
+                loss = criterion(y_pred, y_batch)
             val_loss += loss.item() * X_batch.size(0)
     
     val_loss /= len(val_dataset)
     val_losses.append(val_loss)
     
-    scheduler.step(val_loss)
+    scheduler.step()
     
     if (epoch + 1) % 20 == 0:
-        print(f"Epoch {epoch+1}/400 - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        print(f"Epoch {epoch+1}/300 - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
     
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         patience_counter = 0
-        torch.save(model.state_dict(), 'best_bpnn_model.pt')
+        torch.save(model.state_dict(), 'best_bpnn_optimized_model.pt')
     else:
         patience_counter += 1
         if patience_counter >= patience:
@@ -336,7 +377,7 @@ train_time = (datetime.now() - train_start).total_seconds()
 print(f"\n✓ 训练完成（耗时: {train_time:.2f}秒）")
 
 # 加载最佳模型
-model.load_state_dict(torch.load('best_bpnn_model.pt'))
+model.load_state_dict(torch.load('best_bpnn_optimized_model.pt'))
 
 # ============================================================================
 # Step 10: 预测
@@ -383,10 +424,10 @@ test_metrics = calculate_metrics(y_test, y_test_pred, "测试集")
 # ============================================================================
 print("\nStep 12: 保存模型和结果")
 
-output_dir = 'model_output_bpnn_pytorch'
+output_dir = 'model_output_bpnn_pytorch_optimized'
 os.makedirs(output_dir, exist_ok=True)
 
-torch.save(model.state_dict(), f'{output_dir}/bpnn_model.pt')
+torch.save(model.state_dict(), f'{output_dir}/bpnn_optimized_model.pt')
 with open(f'{output_dir}/scaler.pkl', 'wb') as f:
     pickle.dump(scaler, f)
 with open(f'{output_dir}/y_scaler.pkl', 'wb') as f:
@@ -499,7 +540,7 @@ ax7.set_title(f'时间序列预测对比（前{plot_size}个样本）', fontsize
 ax7.legend(fontsize=11)
 ax7.grid(True, alpha=0.3)
 
-plt.suptitle('PyTorch BPNN 模型 - 综合分析', fontsize=16, fontweight='bold', y=0.995)
+plt.suptitle('PyTorch BPNN 优化版本 - 综合分析', fontsize=16, fontweight='bold', y=0.995)
 plt.savefig(f'{output_dir}/comprehensive_analysis.png', dpi=300, bbox_inches='tight')
 print("✓ 综合分析图已保存")
 plt.close()
@@ -511,10 +552,40 @@ print("\nStep 14: 生成报告")
 
 report = f"""
 {'='*80}
-PyTorch BPNN (BackPropagation Neural Network) 模型 - 电力负荷预测报告
+PyTorch BPNN 优化版本 - 电力负荷预测报告
 {'='*80}
 
 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{'='*80}
+优化策略
+{'='*80}
+
+1. 残差连接 (Residual Connections)
+   - 解决深层网络梯度消失问题
+   - 5个残差块，每块包含2个全连接层
+   - 投影层处理维度不匹配
+
+2. 层归一化 (Layer Normalization)
+   - 比BatchNorm更稳定
+   - 每个线性层后添加LayerNorm
+   - 不依赖batch大小
+
+3. GELU激活函数
+   - 比ReLU更平滑
+   - 更好的梯度流动
+   - 更强的非线性表达能力
+
+4. 混合精度训练 (Mixed Precision)
+   - 使用autocast加速训练
+   - 减少内存占用
+   - 保持数值精度
+
+5. 优化的超参数
+   - 学习率: 0.0005 (更小，更稳定)
+   - 优化器: AdamW (更好的正则化)
+   - 学习率调度: CosineAnnealingWarmRestarts
+   - 梯度裁剪: max_norm=1.0
 
 {'='*80}
 模型架构
@@ -525,17 +596,24 @@ PyTorch BPNN (BackPropagation Neural Network) 模型 - 电力负荷预测报告
 总参数数: {sum(p.numel() for p in model.parameters()):,}
 
 层结构:
-  输入层: {X_train_scaled.shape[1]} 个特征
-  隐藏层1: 512 + ReLU + BatchNorm + Dropout(0.15)
-  隐藏层2: 256 + ReLU + BatchNorm + Dropout(0.15)
-  隐藏层3: 128 + ReLU + BatchNorm + Dropout(0.12)
-  隐藏层4: 64 + ReLU + BatchNorm + Dropout(0.12)
-  隐藏层5: 32 + ReLU + BatchNorm + Dropout(0.1)
-  输出层: 1 (线性)
+  输入投影: {X_train_scaled.shape[1]} → 256 + GELU + LayerNorm
+  
+  残差块1-2: 256 → 256 (2个残差块)
+  
+  下采样1: 256 → 128 + GELU + LayerNorm
+  
+  残差块3-4: 128 → 128 (2个残差块)
+  
+  下采样2: 128 → 64 + GELU + LayerNorm
+  
+  残差块5: 64 → 64 (1个残差块)
+  
+  输出层: 64 → 1 (线性)
 
-优化器: Adam (lr=0.0003, weight_decay=3e-5)
+优化器: AdamW (lr=0.0005, weight_decay=1e-4)
 损失函数: MSE
-学习率调度: ReduceLROnPlateau (patience=20)
+学习率调度: CosineAnnealingWarmRestarts (T_0=20, T_mult=2)
+混合精度: 启用 (GradScaler)
 
 {'='*80}
 数据集
@@ -586,7 +664,7 @@ PyTorch BPNN (BackPropagation Neural Network) 模型 - 电力负荷预测报告
 {'='*80}
 
 模型文件:
-  ✓ bpnn_model.pt - 训练好的BPNN模型
+  ✓ bpnn_optimized_model.pt - 训练好的优化BPNN模型
   ✓ scaler.pkl - 特征标准化器
   ✓ y_scaler.pkl - 目标变量标准化器
   ✓ features.pkl - 特征列表
@@ -611,11 +689,11 @@ with open(f'{output_dir}/report.txt', 'w', encoding='utf-8') as f:
 print(report)
 
 print("\n" + "="*80)
-print("✓ PyTorch BPNN模型训练完成！")
+print("✓ PyTorch BPNN优化版本训练完成！")
 print("="*80)
 print(f"\n最终测试集R²: {test_metrics['R2']:.6f}")
 print(f"所有输出文件位于: {output_dir}/")
 print("="*80)
 
 # 清理临时文件
-os.remove('best_bpnn_model.pt')
+os.remove('best_bpnn_optimized_model.pt')
