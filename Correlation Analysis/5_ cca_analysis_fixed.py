@@ -85,9 +85,8 @@ def cca_weather_vs_extreme(df):
     cca = CCA(n_components=n_components)
     cca.fit(X_weather_scaled, X_extreme_scaled)
     
-    # 获取典型变量
-    U = cca.transform(X_weather_scaled)
-    V = cca.transform(X_extreme_scaled)
+    # 获取典型变量 (使用 fit_transform 的结果)
+    U, V = cca.fit_transform(X_weather_scaled, X_extreme_scaled)
     
     # 计算典型相关系数
     canonical_corrs = []
@@ -195,11 +194,9 @@ def cca_weather_vs_load(df):
     # 执行 CCA
     n_components = min(X_weather_scaled.shape[1], X_load_scaled.shape[1], 5)
     cca = CCA(n_components=n_components)
-    cca.fit(X_weather_scaled, X_load_scaled)
     
     # 获取典型变量
-    U = cca.transform(X_weather_scaled)
-    V = cca.transform(X_load_scaled)
+    U, V = cca.fit_transform(X_weather_scaled, X_load_scaled)
     
     # 计算典型相关系数
     canonical_corrs = []
