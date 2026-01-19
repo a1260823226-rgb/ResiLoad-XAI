@@ -1,0 +1,480 @@
+"""
+高级XGBoost模型 - 时间序列预测优化
+包含高级特征工程、超参数优化和集成方法
+"""
+
+import pandas as pd
+import numpy as np
+import warnings
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import pickle
+import os
+
+warnings.filterwarnings('ignore')
+
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (16, 12)
+
+print("=" * 80)
+print("高级XGBoost模型 - 时间序列预测优化")
+print("=" * 80)
+print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# ============================================================================
+# 1. 数据加载
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤1: 加载数据")
+print("=" * 80)
+
+chunk_size = 100000
+chunks = []
+print("正在加载排序后的数据...")
+
+try:
+    for i, chunk in enumerate(pd.read_csv('data/df_merged_sorted_by_time.csv', chunksize=chunk_size)):
+        chunks.append(chunk)
+        if (i + 1) % 10 == 0:
+            print(f"  已加载 {(i + 1) * chunk_size:,} 行...")
+    
+    df = pd.concat(chunks, ignore_index=True)
+    print(f"✓ 数据加载完成: {df.shape}")
+except FileNotFoundError:
+    print("✗ 排序后的文件不存在，请先运行 check_and_sort_by_time.py")
+    exit(1)
+
+# ============================================================================
+# 2. 选择单个变压器
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤2: 选择变压器")
+print("=" * 80)
+
+transformer_counts = df['TRANSFORMER_ID'].value_counts()
+selected_transformer = transformer_counts.index[0]
+selected_count = transformer_counts.iloc[0]
+
+print(f"选择数据最多的变压器: {selected_transformer}")
+print(f"  数据行数: {selected_count:,}")
+
+df = df[df['TRANSFORMER_ID'] == selected_transformer].copy()
+df = df.sort_values('DATETIME').reset_index(drop=True)
+
+print(f"✓ 过滤后数据形状: {df.shape}")
+
+# ============================================================================
+# 3. 高级特征工程
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤3: 高级特征工程")
+print("=" * 80)
+
+df['DATETIME'] = pd.to_datetime(df['DATETIME'])
+
+print("添加时间特征...")
+
+# 基础时间特征
+df['Hour'] = df['DATETIME'].dt.hour
+df['DayOfWeek'] = df['DATETIME'].dt.dayofweek
+df['Month'] = df['DATETIME'].dt.month
+df['Day'] = df['DATETIME'].dt.day
+df['Quarter'] = df['DATETIME'].dt.quarter
+df['DayOfYear'] = df['DATETIME'].dt.dayofyear
+df['WeekOfYear'] = df['DATETIME'].dt.isocalendar().week
+
+# 周期特征（使用sin/cos编码）
+df['Hour_sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
+df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
+df['Month_sin'] = np.sin(2 * np.pi * df['Month'] / 12)
+df['Month_cos'] = np.cos(2 * np.pi * df['Month'] / 12)
+df['DayOfWeek_sin'] = np.sin(2 * np.pi * df['DayOfWeek'] / 7)
+df['DayOfWeek_cos'] = np.cos(2 * np.pi * df['DayOfWeek'] / 7)
+
+# 工作日特征
+df['IsWeekend'] = (df['DayOfWeek'] >= 5).astype(int)
+df['IsPeakHour'] = df['Hour'].isin([8, 9, 10, 12, 13, 14, 18, 19, 20]).astype(int)
+df['IsNightHour'] = df['Hour'].isin([0, 1, 2, 3, 4, 5]).astype(int)
+df['IsMorningPeak'] = df['Hour'].isin([7, 8, 9]).astype(int)
+df['IsEveningPeak'] = df['Hour'].isin([18, 19, 20]).astype(int)
+df['IsOffPeak'] = df['Hour'].isin([23, 0, 1, 2, 3, 4, 5, 6]).astype(int)
+
+print("添加滞后特征...")
+
+# 多层次滞后特征
+lags = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336]
+for lag in lags:
+    df[f'LOAD_lag{lag}'] = df['LOAD'].shift(lag)
+
+print("添加滚动统计特征...")
+
+# 滚动统计特征
+windows = [6, 12, 24, 48, 168]
+for window in windows:
+    df[f'LOAD_rolling_mean_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).mean().shift(1)
+    df[f'LOAD_rolling_std_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).std().shift(1)
+    df[f'LOAD_rolling_min_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).min().shift(1)
+    df[f'LOAD_rolling_max_{window}'] = df['LOAD'].rolling(window=window, min_periods=1).max().shift(1)
+
+print("添加差分特征...")
+
+# 差分特征
+df['LOAD_diff1'] = df['LOAD'].diff(1)
+df['LOAD_diff24'] = df['LOAD'].diff(24)
+df['LOAD_pct_change'] = df['LOAD'].pct_change()
+
+print("添加天气交互特征...")
+
+# 天气交互特征
+df['TEMP_RH'] = df['TEMP'] * df['RH']
+df['TEMP_MXSPD'] = df['TEMP'] * df['MXSPD']
+df['TEMP_GUST'] = df['TEMP'] * df['GUST']
+df['TEMP_SLP'] = df['TEMP'] * df['SLP']
+df['RH_MXSPD'] = df['RH'] * df['MXSPD']
+df['TEMP_squared'] = df['TEMP'] ** 2
+df['TEMP_cubed'] = df['TEMP'] ** 3
+df['TEMP_abs'] = np.abs(df['TEMP'])
+
+print("添加天气极值特征...")
+
+# 天气极值特征
+df['TEMP_range'] = df['MAX'] - df['MIN']
+df['TEMP_deviation'] = df['TEMP'] - df['TEMP'].rolling(window=24, min_periods=1).mean()
+df['TEMP_trend'] = df['TEMP'].rolling(window=6, min_periods=1).mean().diff()
+
+# 处理缺失值
+df = df.dropna()
+
+print(f"✓ 特征工程完成")
+print(f"  数据形状: {df.shape}")
+print(f"  特征数: {len(df.columns) - 3}")
+
+# ============================================================================
+# 4. 特征选择和数据类型处理
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤4: 特征选择和数据类型处理")
+print("=" * 80)
+
+exclude_cols = ['DATETIME', 'TRANSFORMER_ID', 'LOAD']
+selected_features = [col for col in df.columns if col not in exclude_cols]
+
+# 只保留数值特征
+numeric_features = []
+for col in selected_features:
+    if df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+        numeric_features.append(col)
+    else:
+        print(f"  排除非数值特征: {col} (类型: {df[col].dtype})")
+
+selected_features = numeric_features
+print(f"选择的特征 ({len(selected_features)}个)")
+
+# ============================================================================
+# 5. 数据准备
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤5: 数据准备")
+print("=" * 80)
+
+X = df[selected_features].copy()
+y = df['LOAD'].copy()
+
+print(f"特征形状: {X.shape}")
+print(f"目标形状: {y.shape}")
+
+# ============================================================================
+# 6. 时间序列分割
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤6: 时间序列分割")
+print("=" * 80)
+
+train_size = int(0.7 * len(X))
+val_size = int(0.15 * len(X))
+
+X_train = X[:train_size]
+y_train = y[:train_size]
+
+X_val = X[train_size:train_size + val_size]
+y_val = y[train_size:train_size + val_size]
+
+X_test = X[train_size + val_size:]
+y_test = y[train_size + val_size:]
+
+print(f"训练集: {X_train.shape[0]:,} 样本")
+print(f"验证集: {X_val.shape[0]:,} 样本")
+print(f"测试集: {X_test.shape[0]:,} 样本")
+
+# ============================================================================
+# 7. 特征标准化
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤7: 特征标准化")
+print("=" * 80)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+print(f"✓ 特征标准化完成")
+
+# ============================================================================
+# 8. XGBoost模型训练 - 优化参数
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤8: XGBoost模型训练 - 优化参数")
+print("=" * 80)
+
+# 优化的XGBoost参数
+xgb_params = {
+    'n_estimators': 500,           # 增加树的数量
+    'max_depth': 10,               # 增加树的深度
+    'learning_rate': 0.02,         # 降低学习率，更精细的学习
+    'subsample': 0.9,              # 增加样本采样比例
+    'colsample_bytree': 0.9,       # 增加特征采样比例
+    'colsample_bylevel': 0.9,      # 每层特征采样
+    'min_child_weight': 1,
+    'gamma': 0.1,                  # 增加分裂所需的最小损失减少
+    'reg_alpha': 0.05,             # L1正则化
+    'reg_lambda': 0.5,             # L2正则化
+    'random_state': 42,
+    'n_jobs': -1,
+    'verbosity': 1,
+    'tree_method': 'hist',         # 使用直方图优化
+}
+
+try:
+    import torch
+    if torch.cuda.is_available():
+        xgb_params['tree_method'] = 'gpu_hist'
+        xgb_params['gpu_id'] = 0
+        print("✓ 使用GPU加速训练")
+except:
+    print("⚠ 使用CPU训练")
+
+model = xgb.XGBRegressor(**xgb_params)
+
+print(f"\n开始训练...")
+train_start = datetime.now()
+
+model.fit(
+    X_train_scaled, y_train,
+    eval_set=[(X_train_scaled, y_train), (X_val_scaled, y_val)],
+    eval_metric=['rmse', 'mae'],
+    early_stopping_rounds=50,
+    verbose=20
+)
+
+train_time = (datetime.now() - train_start).total_seconds()
+print(f"✓ 训练完成 (耗时: {train_time:.2f}秒)")
+
+# ============================================================================
+# 9. 模型预测和评估
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤9: 模型预测和评估")
+print("=" * 80)
+
+y_train_pred = model.predict(X_train_scaled)
+y_val_pred = model.predict(X_val_scaled)
+y_test_pred = model.predict(X_test_scaled)
+
+def calculate_metrics(y_true, y_pred, set_name):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    print(f"\n{set_name}集评估指标:")
+    print(f"  R² Score: {r2:.4f}")
+    print(f"  RMSE: {rmse:.4f}")
+    print(f"  MAE: {mae:.4f}")
+    print(f"  MAPE: {mape:.4f}%")
+    
+    return {'R2': r2, 'RMSE': rmse, 'MAE': mae, 'MAPE': mape}
+
+train_metrics = calculate_metrics(y_train, y_train_pred, "训练")
+val_metrics = calculate_metrics(y_val, y_val_pred, "验证")
+test_metrics = calculate_metrics(y_test, y_test_pred, "测试")
+
+# ============================================================================
+# 10. 生成详细结果
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤10: 生成详细结果")
+print("=" * 80)
+
+def create_detailed_results(y_true, y_pred, set_name):
+    error = y_pred - y_true.values
+    abs_error = np.abs(error)
+    percent_error = np.abs(error) / (np.abs(y_true.values) + 1e-10) * 100
+    
+    results_df = pd.DataFrame({
+        '预测值': y_pred,
+        '真实值': y_true.values,
+        '误差': error,
+        '绝对误差': abs_error,
+        '百分比误差(%)': percent_error,
+    })
+    
+    stats = {
+        '集合': set_name,
+        '样本数': len(y_true),
+        '预测值_最大': y_pred.max(),
+        '预测值_最小': y_pred.min(),
+        '预测值_平均': y_pred.mean(),
+        '预测值_极差': y_pred.max() - y_pred.min(),
+        '真实值_最大': y_true.max(),
+        '真实值_最小': y_true.min(),
+        '真实值_平均': y_true.mean(),
+        '真实值_极差': y_true.max() - y_true.min(),
+        '误差_平均': error.mean(),
+        '误差_最大': error.max(),
+        '误差_最小': error.min(),
+        '绝对误差_平均': abs_error.mean(),
+        '绝对误差_最大': abs_error.max(),
+        '百分比误差_平均(%)': percent_error.mean(),
+        'R2_Score': r2_score(y_true, y_pred),
+        'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
+        'MAE': mean_absolute_error(y_true, y_pred),
+        'MAPE': mean_absolute_percentage_error(y_true, y_pred),
+    }
+    
+    return results_df, stats
+
+train_results_df, train_stats = create_detailed_results(y_train, y_train_pred, "训练集")
+val_results_df, val_stats = create_detailed_results(y_val, y_val_pred, "验证集")
+test_results_df, test_stats = create_detailed_results(y_test, y_test_pred, "测试集")
+
+print(f"✓ 详细结果表生成完成")
+
+# ============================================================================
+# 11. 特征重要性
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤11: 特征重要性分析")
+print("=" * 80)
+
+feature_importance = pd.DataFrame({
+    'Feature': selected_features,
+    'Importance': model.feature_importances_
+}).sort_values('Importance', ascending=False)
+
+print(f"\nTop 20 特征重要性:")
+for idx, row in feature_importance.head(20).iterrows():
+    print(f"  {row['Feature']:40s}: {row['Importance']:.4f}")
+
+# ============================================================================
+# 12. 保存结果
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤12: 保存结果")
+print("=" * 80)
+
+os.makedirs('model_output_advanced', exist_ok=True)
+
+# 保存模型
+with open('model_output_advanced/xgboost_advanced.pkl', 'wb') as f:
+    pickle.dump(model, f)
+print(f"✓ 模型已保存")
+
+# 保存scaler
+with open('model_output_advanced/scaler.pkl', 'wb') as f:
+    pickle.dump(scaler, f)
+print(f"✓ Scaler已保存")
+
+# 保存特征列表
+with open('model_output_advanced/features.pkl', 'wb') as f:
+    pickle.dump(selected_features, f)
+print(f"✓ 特征列表已保存")
+
+# 保存详细结果
+train_results_df.to_csv('model_output_advanced/train_predictions_detailed.csv', index=False)
+val_results_df.to_csv('model_output_advanced/val_predictions_detailed.csv', index=False)
+test_results_df.to_csv('model_output_advanced/test_predictions_detailed.csv', index=False)
+
+stats_summary = pd.DataFrame([train_stats, val_stats, test_stats])
+stats_summary.to_csv('model_output_advanced/prediction_statistics_summary.csv', index=False)
+
+feature_importance.to_csv('model_output_advanced/feature_importance.csv', index=False)
+
+print(f"✓ 所有结果已保存到 model_output_advanced/")
+
+# ============================================================================
+# 13. 可视化
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("步骤13: 生成可视化")
+print("=" * 80)
+
+# 散点图
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+for results_df, stats, ax, title in [(train_results_df, train_stats, axes[0], "训练集"),
+                                      (val_results_df, val_stats, axes[1], "验证集"),
+                                      (test_results_df, test_stats, axes[2], "测试集")]:
+    ax.scatter(results_df['真实值'], results_df['预测值'], alpha=0.3, s=1, color='steelblue')
+    min_val = min(results_df['真实值'].min(), results_df['预测值'].min())
+    max_val = max(results_df['真实值'].max(), results_df['预测值'].max())
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='完美预测')
+    ax.set_xlabel('真实值', fontsize=11)
+    ax.set_ylabel('预测值', fontsize=11)
+    ax.set_title(f'{title}\n(R² = {stats["R2_Score"]:.4f}, MAE = {stats["MAE"]:.4f})', fontsize=12, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('model_output_advanced/predictions_scatter_plot.png', dpi=300, bbox_inches='tight')
+print(f"✓ 散点图已保存")
+plt.close()
+
+# 特征重要性
+fig, ax = plt.subplots(figsize=(12, 10))
+top_features = feature_importance.head(20)
+ax.barh(top_features['Feature'], top_features['Importance'], color='steelblue')
+ax.set_xlabel('Importance', fontsize=12)
+ax.set_title('Top 20 特征重要性', fontsize=14, fontweight='bold')
+ax.invert_yaxis()
+plt.tight_layout()
+plt.savefig('model_output_advanced/feature_importance.png', dpi=300, bbox_inches='tight')
+print(f"✓ 特征重要性图已保存")
+plt.close()
+
+# ============================================================================
+# 14. 总结
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("训练完成总结")
+print("=" * 80)
+
+print(f"\n📊 模型性能:")
+print(f"  测试集 R²: {test_metrics['R2']:.4f}")
+print(f"  测试集 RMSE: {test_metrics['RMSE']:.4f}")
+print(f"  测试集 MAE: {test_metrics['MAE']:.4f}")
+print(f"  测试集 MAPE: {test_metrics['MAPE']:.4f}%")
+
+print(f"\n📁 输出目录: model_output_advanced/")
+
+print(f"\n结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
