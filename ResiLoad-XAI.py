@@ -495,10 +495,132 @@ print(f"  平均 R²: {cv_df['R2'].mean():.6f} ± {cv_df['R2'].std():.6f}")
 print(f"  平均 RMSE: {cv_df['RMSE'].mean():.4f} ± {cv_df['RMSE'].std():.4f}")
 
 # ============================================================================
-# Step 15: 保存模型和结果
+# Step 15: SHAP分析
 # ============================================================================
 print("\n" + "=" * 80)
-print("Step 15: 保存模型和结果")
+print("Step 15: SHAP可解释性分析")
+print("=" * 80)
+
+shap_importance = None
+shap_values = None
+
+if SHAP_AVAILABLE:
+    try:
+        print(f"SHAP版本: {shap.__version__}")
+        
+        explainer = shap.TreeExplainer(lgb_model)
+        
+        shap_sample_size = min(1000, len(X_test_selected))
+        print(f"✓ SHAP TreeExplainer初始化完成")
+        print(f"  分析样本数: {shap_sample_size}")
+        
+        print(f"\n计算SHAP值（{shap_sample_size} 个测试样本）...")
+        shap_values = explainer.shap_values(X_test_selected[:shap_sample_size])
+        
+        print(f"✓ SHAP值计算完成")
+        
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        shap_importance = pd.DataFrame({
+            'Feature': selected_feature_names,
+            'SHAP_Importance': mean_abs_shap,
+            'Mean_SHAP_Value': np.mean(shap_values, axis=0),
+            'Std_SHAP_Value': np.std(shap_values, axis=0),
+        }).sort_values('SHAP_Importance', ascending=False)
+        
+        print("\nTop 20 特征（SHAP重要性排名）")
+        print("=" * 80)
+        for idx, row in shap_importance.head(20).iterrows():
+            feature_type = "量子" if "Quantum" in row['Feature'] else "经典"
+            print(f"  {row['Feature']:40s}: {row['SHAP_Importance']:10.6f} [{feature_type}]")
+        
+        output_dir = 'model_output_v6_multi'
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print("\n生成SHAP可视化...")
+        
+        # SHAP摘要图
+        plt.figure(figsize=(14, 10))
+        shap.summary_plot(
+            shap_values,
+            X_test_selected[:shap_sample_size],
+            feature_names=selected_feature_names,
+            max_display=20,
+            show=False
+        )
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/shap_summary_plot.png', dpi=300, bbox_inches='tight')
+        print("✓ SHAP摘要图已保存")
+        plt.close()
+        
+        # SHAP条形图
+        plt.figure(figsize=(14, 10))
+        shap.summary_plot(
+            shap_values,
+            X_test_selected[:shap_sample_size],
+            feature_names=selected_feature_names,
+            plot_type="bar",
+            max_display=20,
+            show=False
+        )
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/shap_bar_plot.png', dpi=300, bbox_inches='tight')
+        print("✓ SHAP条形图已保存")
+        plt.close()
+        
+        # SHAP力图（前5个样本）
+        print("生成SHAP力图...")
+        for i in range(min(5, shap_sample_size)):
+            plt.figure(figsize=(16, 4))
+            shap.force_plot(
+                explainer.expected_value,
+                shap_values[i],
+                X_test_selected[i],
+                feature_names=selected_feature_names,
+                matplotlib=True,
+                show=False
+            )
+            plt.tight_layout()
+            plt.savefig(f'{output_dir}/shap_force_plot_{i}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+        print(f"✓ SHAP力图已保存（前5个样本）")
+        
+        # SHAP依赖图（Top 6特征）
+        print("生成SHAP依赖图...")
+        top_6_features = shap_importance.head(6)['Feature'].tolist()
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.flatten()
+        
+        for idx, feature in enumerate(top_6_features):
+            feature_idx = selected_feature_names.index(feature)
+            ax = axes[idx]
+            shap.dependence_plot(
+                feature_idx,
+                shap_values,
+                X_test_selected[:shap_sample_size],
+                feature_names=selected_feature_names,
+                ax=ax,
+                show=False
+            )
+        
+        plt.tight_layout()
+        plt.savefig(f'{output_dir}/shap_dependence_plots.png', dpi=300, bbox_inches='tight')
+        print("✓ SHAP依赖图已保存")
+        plt.close()
+        
+        print(f"\n✓ SHAP分析完成")
+        
+    except Exception as e:
+        print(f"⚠ SHAP分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+else:
+    print("⚠ SHAP未安装，跳过SHAP分析")
+
+# ============================================================================
+# Step 16: 保存模型和结果
+# ============================================================================
+print("\n" + "=" * 80)
+print("Step 16: 保存模型和结果")
 print("=" * 80)
 
 output_dir = 'model_output_v6_multi'
@@ -544,13 +666,211 @@ print("✓ 交叉验证结果已保存")
 feature_importance_df.to_csv(f'{output_dir}/feature_importance.csv', index=False)
 print("✓ 特征重要性已保存")
 
+if shap_importance is not None:
+    shap_importance.to_csv(f'{output_dir}/shap_importance.csv', index=False)
+    print("✓ SHAP重要性已保存")
+    
+    # 生成SHAP详细分析报告
+    shap_detail_report = []
+    for idx, row in shap_importance.iterrows():
+        shap_detail_report.append({
+            'Rank': idx + 1,
+            'Feature': row['Feature'],
+            'SHAP_Importance': row['SHAP_Importance'],
+            'Mean_SHAP_Value': row['Mean_SHAP_Value'],
+            'Std_SHAP_Value': row['Std_SHAP_Value'],
+            'Feature_Type': 'Quantum' if 'Quantum' in row['Feature'] else 'Classical',
+            'LightGBM_Importance': feature_importance_df[feature_importance_df['Feature'] == row['Feature']]['Importance'].values[0] if row['Feature'] in feature_importance_df['Feature'].values else 0,
+        })
+    
+    shap_detail_df = pd.DataFrame(shap_detail_report)
+    shap_detail_df.to_csv(f'{output_dir}/shap_detailed_analysis.csv', index=False)
+    print("✓ SHAP详细分析已保存")
+    
+    # 生成特征对比分析（SHAP vs LightGBM）
+    comparison_data = []
+    for feature in selected_feature_names:
+        lgb_imp = feature_importance_df[feature_importance_df['Feature'] == feature]['Importance'].values
+        shap_imp = shap_importance[shap_importance['Feature'] == feature]['SHAP_Importance'].values
+        
+        if len(lgb_imp) > 0 and len(shap_imp) > 0:
+            comparison_data.append({
+                'Feature': feature,
+                'LightGBM_Importance': lgb_imp[0],
+                'SHAP_Importance': shap_imp[0],
+                'Importance_Ratio': shap_imp[0] / (lgb_imp[0] + 1e-10),
+                'Feature_Type': 'Quantum' if 'Quantum' in feature else 'Classical',
+            })
+    
+    comparison_df = pd.DataFrame(comparison_data).sort_values('SHAP_Importance', ascending=False)
+    comparison_df.to_csv(f'{output_dir}/feature_importance_comparison.csv', index=False)
+    print("✓ 特征重要性对比已保存")
+
 print(f"\n✓ 所有结果已保存到: {output_dir}/")
 
 # ============================================================================
-# Step 16: 生成最终报告
+# Step 17: 可视化分析
 # ============================================================================
 print("\n" + "=" * 80)
-print("Step 16: 生成最终报告")
+print("Step 17: 可视化分析")
+print("=" * 80)
+
+fig = plt.figure(figsize=(20, 14))
+gs = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
+
+# 1-3. 散点图
+for idx, (ax_pos, (y_true, y_pred, title, color)) in enumerate([
+    (gs[0, 0], (y_train, y_train_pred, f'训练集 (R²={train_metrics["R2"]:.4f})', 'steelblue')),
+    (gs[0, 1], (y_val, y_val_pred, f'验证集 (R²={val_metrics["R2"]:.4f})', 'lightgreen')),
+    (gs[0, 2], (y_test, y_test_pred, f'测试集 (R²={test_metrics["R2"]:.4f})', 'coral')),
+]):
+    ax = fig.add_subplot(ax_pos)
+    ax.scatter(y_true, y_pred, alpha=0.3, s=1, color=color)
+    min_val = min(y_true.min(), y_pred.min())
+    max_val = max(y_true.max(), y_pred.max())
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='完美预测')
+    ax.set_xlabel('实际值', fontsize=11)
+    ax.set_ylabel('预测值', fontsize=11)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+# 4. 误差分布
+ax4 = fig.add_subplot(gs[1, 0])
+errors = y_test_pred - y_test.values
+ax4.hist(errors, bins=30, edgecolor='black', alpha=0.7, color='steelblue')
+ax4.axvline(x=0, color='r', linestyle='--', lw=2)
+ax4.set_xlabel('误差', fontsize=11)
+ax4.set_ylabel('频数', fontsize=11)
+ax4.set_title('误差分布', fontsize=12, fontweight='bold')
+ax4.grid(True, alpha=0.3, axis='y')
+
+# 5. 残差图
+ax5 = fig.add_subplot(gs[1, 1])
+ax5.scatter(y_test_pred, errors, alpha=0.3, s=1, color='steelblue')
+ax5.axhline(y=0, color='r', linestyle='--', lw=2)
+ax5.set_xlabel('预测值', fontsize=11)
+ax5.set_ylabel('残差', fontsize=11)
+ax5.set_title('残差图', fontsize=12, fontweight='bold')
+ax5.grid(True, alpha=0.3)
+
+# 6. R²对比
+ax6 = fig.add_subplot(gs[1, 2])
+sets = ['训练集', '验证集', '测试集']
+r2_scores = [train_metrics['R2'], val_metrics['R2'], test_metrics['R2']]
+colors = ['steelblue', 'lightgreen', 'coral']
+bars = ax6.bar(sets, r2_scores, color=colors, alpha=0.8, edgecolor='black', linewidth=2)
+ax6.set_ylabel('R² Score', fontsize=11)
+ax6.set_title('R²对比', fontsize=12, fontweight='bold')
+ax6.set_ylim([0, 1.0])
+ax6.grid(True, alpha=0.3, axis='y')
+for bar, score in zip(bars, r2_scores):
+    height = bar.get_height()
+    ax6.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{score:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+# 7. LightGBM特征重要性
+ax7 = fig.add_subplot(gs[2, :2])
+top_features = feature_importance_df.head(15)
+colors_feat = ['red' if 'Quantum' in f else 'steelblue' for f in top_features['Feature']]
+ax7.barh(top_features['Feature'], top_features['Importance'], color=colors_feat, alpha=0.8)
+ax7.set_xlabel('重要性', fontsize=11)
+ax7.set_title('LightGBM特征重要性 Top 15 (红色=量子特征)', fontsize=12, fontweight='bold')
+ax7.invert_yaxis()
+ax7.grid(True, alpha=0.3, axis='x')
+
+# 8. 指标总结
+ax8 = fig.add_subplot(gs[2, 2])
+ax8.axis('off')
+metrics_text = f"""
+V6 多变压器模型性能总结
+
+数据统计:
+  变压器数: {len(valid_transformers)}
+  总样本数: {len(df):,}
+
+训练集:
+  R² = {train_metrics['R2']:.6f}
+  RMSE = {train_metrics['RMSE']:.4f}
+
+验证集:
+  R² = {val_metrics['R2']:.6f}
+  RMSE = {val_metrics['RMSE']:.4f}
+
+测试集:
+  R² = {test_metrics['R2']:.6f}
+  RMSE = {test_metrics['RMSE']:.4f}
+
+交叉验证:
+  平均 R²: {cv_df['R2'].mean():.6f}
+  Std: {cv_df['R2'].std():.6f}
+
+特征统计:
+  原始: {len(all_features)}
+  选择: {len(selected_feature_names)}
+  减少: {(1-len(selected_feature_names)/len(all_features))*100:.1f}%
+"""
+ax8.text(0.05, 0.5, metrics_text, fontsize=9, family='monospace',
+         verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+
+plt.suptitle('V6 多变压器版本 - LightGBM + 特征选择 - 综合分析', fontsize=16, fontweight='bold', y=0.995)
+plt.savefig(f'{output_dir}/comprehensive_analysis.png', dpi=300, bbox_inches='tight')
+print("✓ 综合分析图已保存")
+plt.close()
+
+# 时间序列预测图
+print("生成时间序列预测图...")
+fig, ax = plt.subplots(figsize=(16, 6))
+plot_size = min(500, len(y_test))
+x_axis = range(plot_size)
+ax.plot(x_axis, y_test.values[:plot_size], label='实际值', color='blue', alpha=0.7, linewidth=1.5)
+ax.plot(x_axis, y_test_pred[:plot_size], label='预测值', color='red', alpha=0.7, linewidth=1.5)
+ax.fill_between(x_axis, y_test.values[:plot_size], y_test_pred[:plot_size], alpha=0.2, color='gray')
+ax.set_xlabel('时间步', fontsize=12)
+ax.set_ylabel('负荷', fontsize=12)
+ax.set_title(f'时间序列预测对比（前{plot_size}个样本）', fontsize=14, fontweight='bold')
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{output_dir}/timeseries_prediction.png', dpi=300, bbox_inches='tight')
+print("✓ 时间序列预测图已保存")
+plt.close()
+
+# SHAP vs LightGBM特征重要性对比
+if shap_importance is not None:
+    print("生成特征重要性对比图...")
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # LightGBM重要性
+    top_15_lgb = feature_importance_df.head(15)
+    colors_lgb = ['red' if 'Quantum' in f else 'steelblue' for f in top_15_lgb['Feature']]
+    axes[0].barh(top_15_lgb['Feature'], top_15_lgb['Importance'], color=colors_lgb, alpha=0.8)
+    axes[0].set_xlabel('重要性', fontsize=12)
+    axes[0].set_title('LightGBM特征重要性 Top 15', fontsize=13, fontweight='bold')
+    axes[0].invert_yaxis()
+    axes[0].grid(True, alpha=0.3, axis='x')
+    
+    # SHAP重要性
+    top_15_shap = shap_importance.head(15)
+    colors_shap = ['red' if 'Quantum' in f else 'steelblue' for f in top_15_shap['Feature']]
+    axes[1].barh(top_15_shap['Feature'], top_15_shap['SHAP_Importance'], color=colors_shap, alpha=0.8)
+    axes[1].set_xlabel('SHAP重要性', fontsize=12)
+    axes[1].set_title('SHAP特征重要性 Top 15', fontsize=13, fontweight='bold')
+    axes[1].invert_yaxis()
+    axes[1].grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_dir}/feature_importance_comparison.png', dpi=300, bbox_inches='tight')
+    print("✓ 特征重要性对比图已保存")
+    plt.close()
+
+print("\n✓ 可视化完成")
+
+# ============================================================================
+# Step 18: 生成最终报告
+# ============================================================================
+print("\n" + "=" * 80)
+print("Step 18: 生成最终报告")
 print("=" * 80)
 
 report = f"""
@@ -620,6 +940,42 @@ for idx, row in cv_df.iterrows():
 
 report += f"""
 {'=' * 80}
+LightGBM 特征重要性分析
+{'=' * 80}
+
+Top 20 特征:
+"""
+
+for idx, row in feature_importance_df.head(20).iterrows():
+    feature_type = "量子" if "Quantum" in row['Feature'] else "经典"
+    report += f"  {idx + 1:2d}. {row['Feature']:40s}: {row['Importance']:10.6f} [{feature_type}]\n"
+
+if shap_importance is not None:
+    report += f"""
+{'=' * 80}
+SHAP 特征重要性分析
+{'=' * 80}
+
+Top 20 特征（SHAP重要性排名）:
+"""
+    for idx, row in shap_importance.head(20).iterrows():
+        feature_type = "量子" if "Quantum" in row['Feature'] else "经典"
+        report += f"  {idx + 1:2d}. {row['Feature']:40s}: {row['SHAP_Importance']:10.6f} [{feature_type}]\n"
+    
+    report += f"""
+SHAP 统计信息:
+  平均SHAP值范围: [{shap_importance['Mean_SHAP_Value'].min():.6f}, {shap_importance['Mean_SHAP_Value'].max():.6f}]
+  SHAP标准差范围: [{shap_importance['Std_SHAP_Value'].min():.6f}, {shap_importance['Std_SHAP_Value'].max():.6f}]
+
+特征类型分布:
+"""
+    quantum_count = (shap_importance['Feature'].str.contains('Quantum')).sum()
+    classical_count = len(shap_importance) - quantum_count
+    report += f"  量子特征: {quantum_count} 个\n"
+    report += f"  经典特征: {classical_count} 个\n"
+
+report += f"""
+{'=' * 80}
 版本对比
 {'=' * 80}
 
@@ -654,6 +1010,11 @@ V6 多变压器版本 (当前):
    - 保留累积重要性 95% 的特征
    - 减少过拟合风险
 
+5. ✓ 完整的SHAP可解释性分析
+   - SHAP重要性排名
+   - SHAP摘要图、条形图、力图、依赖图
+   - 特征重要性对比分析
+
 {'=' * 80}
 输出文件
 {'=' * 80}
@@ -668,7 +1029,22 @@ V6 多变压器版本 (当前):
   ✓ test_predictions.csv - 测试集预测结果
   ✓ metrics.csv - 评估指标
   ✓ cv_results.csv - 交叉验证结果
-  ✓ feature_importance.csv - 特征重要性
+  ✓ feature_importance.csv - LightGBM特征重要性
+  ✓ shap_importance.csv - SHAP特征重要性
+  ✓ shap_detailed_analysis.csv - SHAP详细分析
+  ✓ feature_importance_comparison.csv - 特征重要性对比
+
+可视化文件:
+  ✓ comprehensive_analysis.png - 综合分析图
+  ✓ timeseries_prediction.png - 时间序列预测图
+  ✓ feature_importance_comparison.png - 特征重要性对比图
+  ✓ shap_summary_plot.png - SHAP摘要图
+  ✓ shap_bar_plot.png - SHAP条形图
+  ✓ shap_force_plot_*.png - SHAP力图（前5个样本）
+  ✓ shap_dependence_plots.png - SHAP依赖图
+
+缓存文件:
+  ✓ quantum_cache_v6_multi/ - 量子特征缓存目录
 
 输出目录: {output_dir}/
 
